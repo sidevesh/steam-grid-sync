@@ -1,0 +1,1256 @@
+#!/usr/bin/env bash
+
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4))); then
+    printf 'steam-grid-sync requires Bash 4.4 or newer.\n' >&2
+    exit 2
+fi
+
+set -u
+set -o pipefail
+
+PROGRAM_NAME="Steam Artwork Sync"
+PROGRAM_COMMAND="steam-grid-sync"
+
+if [[ -n "${XDG_CONFIG_HOME:-}" && "${XDG_CONFIG_HOME}" == /* ]]; then
+    DEFAULT_CONFIG_DIR="$XDG_CONFIG_HOME/steam-grid-sync"
+else
+    DEFAULT_CONFIG_DIR="$HOME/.config/steam-grid-sync"
+fi
+CONFIG_FILE="${STEAM_GRID_CONFIG:-$DEFAULT_CONFIG_DIR/config}"
+
+if [[ -n "${XDG_STATE_HOME:-}" && "${XDG_STATE_HOME}" == /* ]]; then
+    DEFAULT_STATE_DIR="$XDG_STATE_HOME/steam-grid-sync"
+else
+    DEFAULT_STATE_DIR="$HOME/.local/state/steam-grid-sync"
+fi
+if [[ -n "${XDG_DATA_HOME:-}" && "${XDG_DATA_HOME}" == /* ]]; then
+    DEFAULT_DATA_DIR="$XDG_DATA_HOME/steam-grid-sync"
+else
+    DEFAULT_DATA_DIR="$HOME/.local/share/steam-grid-sync"
+fi
+STATE_FILE="${STEAM_GRID_STATE:-$DEFAULT_STATE_DIR/host-state}"
+KNOWN_HOSTS_FILE="${STEAM_GRID_KNOWN_HOSTS:-$DEFAULT_CONFIG_DIR/known_hosts}"
+KEY_DIR="${STEAM_GRID_KEY_DIR:-$DEFAULT_DATA_DIR/keys}"
+KEY_FILE="$KEY_DIR/id_ed25519"
+CLIENT_ID_FILE="$DEFAULT_DATA_DIR/client-id"
+
+MODE=""
+COMMAND="sync"
+RESTART_OVERRIDE=""
+WORK_DIR=""
+CONTROL_SOCKET=""
+MASTER_STARTED=0
+CURRENT_HOST_FINGERPRINT=""
+STATE_VALID=0
+STATE_WRITTEN=0
+DEDICATED_KEY_WORKS=0
+DEDICATED_KEY_BROKEN=0
+CONNECTION_USES_DEDICATED_KEY=0
+PROGRESS_ACTIVE=0
+PROGRESS_FD=""
+PROGRESS_PID=""
+
+CLI_HOST=""
+CLI_USER=""
+CLI_PORT=""
+CLI_HOST_PLATFORM=""
+CLI_WINDOWS_HOST_STEAM_PATH=""
+CLI_LINUX_HOST_STEAM_PATH=""
+CLI_CLIENT_STEAM_PATH=""
+CLI_STEAM_USER_ID=""
+CLI_CONFLICT_POLICY=""
+CLI_RESTART_POLICY=""
+CLI_CONNECT_TIMEOUT=""
+
+CFG_HOST=""
+CFG_USER=""
+CFG_PORT=""
+CFG_HOST_PLATFORM=""
+CFG_WINDOWS_HOST_STEAM_PATH=""
+CFG_LINUX_HOST_STEAM_PATH=""
+CFG_CLIENT_STEAM_PATH=""
+CFG_STEAM_USER_ID=""
+CFG_CONFLICT_POLICY=""
+CFG_RESTART_POLICY=""
+CFG_CONNECT_TIMEOUT=""
+CFG_CONFIG_VERSION=""
+
+STATE_VERSION=""
+STATE_HOST=""
+STATE_USER=""
+STATE_PORT=""
+STATE_HOST_KEY_FINGERPRINT=""
+STATE_HOST_PLATFORM=""
+STATE_HOST_STEAM_PATH=""
+
+script_path="$(readlink -f -- "$0")"
+
+askpass_helper() {
+    local prompt="${1:-SSH authentication required}" askpass_user askpass_host
+    if [[ "${SSH_ASKPASS_PROMPT:-}" == "confirm" ]]; then
+        if command -v zenity >/dev/null 2>&1; then
+            zenity --question --title="$PROGRAM_NAME — SSH verification" --text="$prompt"
+        elif command -v kdialog >/dev/null 2>&1; then
+            kdialog --title "$PROGRAM_NAME — SSH verification" --yesno "$prompt"
+        else
+            return 1
+        fi
+        return
+    fi
+    askpass_user="${STEAM_GRID_ASKPASS_USER:-the configured SSH user}"
+    askpass_host="${STEAM_GRID_ASKPASS_HOST:-the configured host}"
+    if [[ "$prompt" != Enter\ passphrase\ for\ key\ * ]]; then
+        prompt="Steam Artwork Sync needs the SSH account password for:
+
+User: $askpass_user
+Host: $askpass_host
+
+It will use this connection to read Steam artwork from the host and copy missing artwork to this computer. The password is not stored.
+
+On Windows, enter the account password—not a Windows Hello PIN."
+    fi
+    if command -v zenity >/dev/null 2>&1; then
+        zenity --entry --hide-text --title="$PROGRAM_NAME — SSH authentication" --text="$prompt"
+    elif command -v kdialog >/dev/null 2>&1; then
+        kdialog --title "$PROGRAM_NAME — SSH authentication" --password "$prompt"
+    else
+        return 1
+    fi
+}
+
+if [[ "${STEAM_GRID_ASKPASS_HELPER:-0}" == "1" ]]; then
+    askpass_helper "${1:-}"
+    exit $?
+fi
+
+usage() {
+    cat <<'EOF'
+Usage:
+  steam-grid-sync [sync] [MODE] [OPTIONS]
+  steam-grid-sync init [--gui] [--config PATH]
+  steam-grid-sync setup-key [--gui] [--config PATH]
+  steam-grid-sync remove-key [--gui] [--config PATH]
+  steam-grid-sync test-connection [--gui] [--config PATH]
+  steam-grid-sync connection-settings [--gui] [--config PATH]
+  steam-grid-sync show-fingerprint [--gui] [--config PATH]
+  steam-grid-sync ssh-help [--gui]
+  steam-grid-sync show-config [--config PATH]
+
+Commands:
+  sync                         Synchronize artwork (the default command).
+  init                         Interactively create the configuration file.
+  setup-key                    Enable or repair restricted passwordless access.
+  remove-key                   Remove this client's managed key from the host.
+  test-connection              Verify SSH, Steam discovery, and userdata access.
+  connection-settings          Open connection management (GUI with --gui).
+  show-fingerprint             Show the host identity currently presented.
+  ssh-help                     Show Windows and Linux SSH server setup help.
+  show-config                  Print the configuration path and contents.
+
+Modes:
+  --gui                        Use graphical progress windows and dialogs.
+  --non-interactive            Never prompt; require trusted key authentication.
+
+Connection options:
+  --host HOST                  SSH hostname or address.
+  --user USER                  SSH username.
+  --port PORT                  SSH port.
+  --connect-timeout SECONDS    Connection timeout.
+
+Steam options:
+  --host-platform PLATFORM     auto, windows, or linux.
+  --windows-host-steam-path PATH
+                               Explicit Steam root when the host is Windows.
+  --linux-host-steam-path PATH Explicit Steam root when the host is Linux.
+  --client-steam-path PATH     Explicit client Steam root; skips local discovery.
+  --steam-user-id ID           Sync only this userdata ID instead of all matches.
+  --conflict-policy POLICY     preserve-client (default) or host-wins.
+
+Restart options:
+  --restart-policy POLICY      ask, always, or never.
+  --restart-steam-if-changed   Alias for --restart-policy always.
+  --no-restart                 Alias for --restart-policy never.
+
+General options:
+  --config PATH                Use a different configuration file.
+  -h, --help                   Show this help.
+
+Precedence is command-line options, environment variables, configuration,
+then automatic discovery and defaults. Passwords are never stored.
+EOF
+}
+
+require_option_value() {
+    local option="$1" remaining="$2"
+    ((remaining >= 2)) || { printf 'Option %s requires a value.\n' "$option" >&2; exit 2; }
+}
+
+if (($#)) && [[ "$1" == "sync" || "$1" == "init" || "$1" == "setup-key" || "$1" == "remove-key" || "$1" == "test-connection" || "$1" == "connection-settings" || "$1" == "show-fingerprint" || "$1" == "ssh-help" || "$1" == "show-config" ]]; then
+    COMMAND="$1"
+    shift
+elif (($#)) && [[ "$1" != -* ]]; then
+    printf 'Unknown command: %s\n' "$1" >&2
+    usage >&2
+    exit 2
+fi
+
+while (($#)); do
+    case "$1" in
+        --gui)
+            [[ -z "$MODE" || "$MODE" == "gui" ]] || { printf 'Only one mode may be selected.\n' >&2; exit 2; }
+            MODE="gui"
+            ;;
+        --non-interactive)
+            [[ -z "$MODE" || "$MODE" == "headless" ]] || { printf 'Only one mode may be selected.\n' >&2; exit 2; }
+            MODE="headless"
+            ;;
+        --config) require_option_value "$1" "$#"; CONFIG_FILE="$2"; shift ;;
+        --host) require_option_value "$1" "$#"; CLI_HOST="$2"; shift ;;
+        --user) require_option_value "$1" "$#"; CLI_USER="$2"; shift ;;
+        --port) require_option_value "$1" "$#"; CLI_PORT="$2"; shift ;;
+        --connect-timeout) require_option_value "$1" "$#"; CLI_CONNECT_TIMEOUT="$2"; shift ;;
+        --host-platform) require_option_value "$1" "$#"; CLI_HOST_PLATFORM="$2"; shift ;;
+        --windows-host-steam-path) require_option_value "$1" "$#"; CLI_WINDOWS_HOST_STEAM_PATH="$2"; shift ;;
+        --linux-host-steam-path) require_option_value "$1" "$#"; CLI_LINUX_HOST_STEAM_PATH="$2"; shift ;;
+        --client-steam-path) require_option_value "$1" "$#"; CLI_CLIENT_STEAM_PATH="$2"; shift ;;
+        --steam-user-id) require_option_value "$1" "$#"; CLI_STEAM_USER_ID="$2"; shift ;;
+        --conflict-policy) require_option_value "$1" "$#"; CLI_CONFLICT_POLICY="$2"; shift ;;
+        --restart-policy) require_option_value "$1" "$#"; CLI_RESTART_POLICY="$2"; shift ;;
+        --restart-steam-if-changed) RESTART_OVERRIDE="always" ;;
+        --no-restart) RESTART_OVERRIDE="never" ;;
+        -h|--help) usage; exit 0 ;;
+        *) printf 'Unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+    esac
+    shift
+done
+
+if [[ -z "$MODE" ]]; then
+    if [[ -t 0 && -t 1 ]]; then MODE="terminal"; else MODE="gui"; fi
+fi
+
+progress_start() {
+    local message="$1"
+    ((PROGRESS_ACTIVE == 0)) || { progress_update "$message"; return; }
+    if [[ "$MODE" == "gui" ]] && command -v zenity >/dev/null 2>&1; then
+        exec {PROGRESS_FD}> >(zenity --progress --pulsate --no-cancel --auto-close \
+            --width=520 --title="$PROGRAM_NAME" --text="$message" 2>/dev/null)
+        PROGRESS_PID=$!
+        PROGRESS_ACTIVE=1
+    elif [[ "$MODE" != "gui" ]]; then
+        printf '%s\n' "$message"
+    fi
+}
+
+progress_update() {
+    local message="$1"
+    if ((PROGRESS_ACTIVE)) && [[ -n "$PROGRESS_FD" ]]; then
+        printf '# %s\n' "$message" >&"$PROGRESS_FD" 2>/dev/null || true
+    elif [[ "$MODE" != "gui" ]]; then
+        printf '%s\n' "$message"
+    fi
+}
+
+progress_stop() {
+    if ((PROGRESS_ACTIVE)); then
+        if [[ -n "$PROGRESS_FD" ]]; then exec {PROGRESS_FD}>&- 2>/dev/null || true; fi
+        if [[ -n "$PROGRESS_PID" ]]; then wait "$PROGRESS_PID" 2>/dev/null || true; fi
+        PROGRESS_ACTIVE=0
+        PROGRESS_FD=""
+        PROGRESS_PID=""
+    fi
+}
+
+show_error() {
+    local message="$1"
+    progress_stop
+    if [[ "$MODE" == "gui" ]]; then
+        if command -v zenity >/dev/null 2>&1; then
+            zenity --error --title="$PROGRAM_NAME" --text="$message" >/dev/null 2>&1 || true
+        elif command -v kdialog >/dev/null 2>&1; then
+            kdialog --title "$PROGRAM_NAME" --error "$message" >/dev/null 2>&1 || true
+        else
+            printf 'ERROR: %s\n' "$message" >&2
+        fi
+    else
+        printf 'ERROR: %s\n' "$message" >&2
+    fi
+}
+
+show_info() {
+    local message="$1"
+    progress_stop
+    if [[ "$MODE" == "gui" ]]; then
+        if command -v zenity >/dev/null 2>&1; then
+            zenity --info --title="$PROGRAM_NAME" --text="$message" >/dev/null 2>&1 || true
+        elif command -v kdialog >/dev/null 2>&1; then
+            kdialog --title "$PROGRAM_NAME" --msgbox "$message" >/dev/null 2>&1 || true
+        else
+            printf '%s\n' "$message"
+        fi
+    else
+        printf '%s\n' "$message"
+    fi
+}
+
+confirm_action() {
+    local message="$1" yes_label="${2:-Continue}" no_label="${3:-Cancel}"
+    progress_stop
+    if [[ "$MODE" == "gui" ]]; then
+        if command -v zenity >/dev/null 2>&1; then
+            zenity --question --title="$PROGRAM_NAME" --ok-label="$yes_label" --cancel-label="$no_label" --text="$message"
+        elif command -v kdialog >/dev/null 2>&1; then
+            kdialog --title "$PROGRAM_NAME" --yes-label "$yes_label" --no-label "$no_label" --yesno "$message"
+        else
+            return 1
+        fi
+    else
+        local answer
+        read -r -p "$message [y/N] " answer
+        [[ "$answer" == "y" || "$answer" == "Y" || "$answer" == "yes" || "$answer" == "YES" ]]
+    fi
+}
+
+fail() { local exit_code="$1"; shift; show_error "$*"; exit "$exit_code"; }
+
+trim_value() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+load_config() {
+    local line key value line_number=0
+    [[ -f "$CONFIG_FILE" ]] || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        ((line_number += 1))
+        line="$(trim_value "$line")"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        [[ "$line" == *=* ]] || fail 2 "Invalid configuration line $line_number in $CONFIG_FILE."
+        key="$(trim_value "${line%%=*}")"
+        value="$(trim_value "${line#*=}")"
+        case "$key" in
+            config_version) CFG_CONFIG_VERSION="$value" ;;
+            host) CFG_HOST="$value" ;;
+            user) CFG_USER="$value" ;;
+            port) CFG_PORT="$value" ;;
+            host_platform) CFG_HOST_PLATFORM="$value" ;;
+            windows_host_steam_path) CFG_WINDOWS_HOST_STEAM_PATH="$value" ;;
+            linux_host_steam_path) CFG_LINUX_HOST_STEAM_PATH="$value" ;;
+            client_steam_path) CFG_CLIENT_STEAM_PATH="$value" ;;
+            steam_user_id) CFG_STEAM_USER_ID="$value" ;;
+            conflict_policy) CFG_CONFLICT_POLICY="$value" ;;
+            restart_policy) CFG_RESTART_POLICY="$value" ;;
+            connect_timeout) CFG_CONNECT_TIMEOUT="$value" ;;
+            *) fail 2 "Unknown configuration key '$key' on line $line_number in $CONFIG_FILE." ;;
+        esac
+    done <"$CONFIG_FILE"
+}
+
+gui_entry() {
+    local title="$1" prompt="$2" default_value="${3:-}"
+    if command -v zenity >/dev/null 2>&1; then
+        zenity --entry --title="$title" --text="$prompt" --entry-text="$default_value"
+    elif command -v kdialog >/dev/null 2>&1; then
+        kdialog --title "$title" --inputbox "$prompt" "$default_value"
+    else
+        return 1
+    fi
+}
+
+show_ssh_help() {
+    show_info "The host computer must run an SSH server before artwork can be synchronized.
+
+Windows 10/11:
+1. Open Settings → System → Optional features.
+2. Install OpenSSH Server.
+3. Open Services, start ‘OpenSSH SSH Server’, and set it to Automatic.
+4. Ensure the OpenSSH Server firewall rule is enabled.
+
+Linux (Debian/Ubuntu):
+1. Install it with: sudo apt install openssh-server
+2. Start it with: sudo systemctl enable --now ssh
+
+Other Linux distributions provide the same service as openssh-server, usually named sshd.
+
+Then run Test Connection again."
+}
+
+connection_settings_menu() {
+    local choice
+    [[ "$MODE" != "headless" ]] || fail 2 "Connection settings are interactive."
+    if [[ "$MODE" == "gui" ]] && command -v zenity >/dev/null 2>&1; then
+        choice="$(zenity --list --title="$PROGRAM_NAME — Connection Settings" \
+            --width=650 --height=360 --hide-column=1 \
+            --column=Action --column=Description \
+            test "Test the configured host and Steam access" \
+            setup "Enable or repair passwordless access" \
+            remove "Remove passwordless access" \
+            fingerprint "Show the host SSH fingerprint" \
+            help "How to install SSH Server on Windows or Linux")" || exit 0
+    elif [[ "$MODE" == "gui" ]] && command -v kdialog >/dev/null 2>&1; then
+        choice="$(kdialog --title "$PROGRAM_NAME — Connection Settings" --menu "Choose an action" \
+            test "Test connection" setup "Enable/repair passwordless access" \
+            remove "Remove passwordless access" fingerprint "Show host fingerprint" help "SSH Server help")" || exit 0
+    else
+        printf '%s\n' '1) Test connection' '2) Enable/repair passwordless access' '3) Remove passwordless access' '4) Show host fingerprint' '5) SSH Server help'
+        printf 'Choice: '; IFS= read -r choice
+        case "$choice" in 1) choice=test;; 2) choice=setup;; 3) choice=remove;; 4) choice=fingerprint;; 5) choice=help;; *) exit 0;; esac
+    fi
+    case "$choice" in
+        test) COMMAND="test-connection" ;;
+        setup) COMMAND="setup-key" ;;
+        remove) COMMAND="remove-key" ;;
+        fingerprint) COMMAND="show-fingerprint" ;;
+        help) show_ssh_help; exit 0 ;;
+        *) exit 0 ;;
+    esac
+}
+
+load_state() {
+    local line key value
+    [[ -f "$STATE_FILE" ]] || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="$(trim_value "$line")"
+        [[ -z "$line" || "$line" == \#* || "$line" != *=* ]] && continue
+        key="$(trim_value "${line%%=*}")"
+        value="$(trim_value "${line#*=}")"
+        case "$key" in
+            state_version) STATE_VERSION="$value" ;;
+            host) STATE_HOST="$value" ;;
+            user) STATE_USER="$value" ;;
+            port) STATE_PORT="$value" ;;
+            host_key_fingerprint) STATE_HOST_KEY_FINGERPRINT="$value" ;;
+            host_platform) STATE_HOST_PLATFORM="$value" ;;
+            host_steam_path) STATE_HOST_STEAM_PATH="$value" ;;
+        esac
+    done <"$STATE_FILE"
+}
+
+write_host_state() {
+    local platform="$1" steam_path="$2" temporary_state state_dir
+    state_dir="${STATE_FILE%/*}"
+    [[ "$state_dir" != "$STATE_FILE" ]] || state_dir="."
+    umask 077
+    mkdir -p -- "$state_dir" || fail 6 "Could not create state directory: $state_dir"
+    temporary_state="$(mktemp "$state_dir/.host-state.XXXXXX")" || fail 6 "Could not create host state."
+    {
+        printf '# Automatically generated. Delete this file to repeat host discovery.\n'
+        printf 'state_version=1\n'
+        printf 'host=%s\n' "$REMOTE_HOST"
+        printf 'user=%s\n' "$REMOTE_USER"
+        printf 'port=%s\n' "$REMOTE_PORT"
+        printf 'host_key_fingerprint=%s\n' "$CURRENT_HOST_FINGERPRINT"
+        printf 'host_platform=%s\n' "$platform"
+        printf 'host_steam_path=%s\n' "$steam_path"
+    } >"$temporary_state"
+    chmod 0600 "$temporary_state"
+    mv -- "$temporary_state" "$STATE_FILE" || fail 6 "Could not install host state at $STATE_FILE."
+    STATE_WRITTEN=1
+}
+
+write_initial_config() {
+    local initial_host="$1" initial_user="$2" initial_port="$3"
+    local config_dir temporary_config
+    config_dir="${CONFIG_FILE%/*}"
+    [[ "$config_dir" != "$CONFIG_FILE" ]] || config_dir="."
+    umask 077
+    mkdir -p -- "$config_dir" || fail 2 "Could not create configuration directory: $config_dir"
+    temporary_config="$(mktemp "$config_dir/.config.XXXXXX")" || fail 2 "Could not create a temporary configuration file."
+    {
+        printf '# Configuration format version.\n'
+        printf 'config_version=1\n\n'
+        printf '# Hostname or IP address of the computer whose Steam artwork will be pulled.\n'
+        printf 'host=%s\n\n' "$initial_host"
+        printf '# SSH username on the host computer.\n'
+        printf 'user=%s\n\n' "$initial_user"
+        printf '# SSH server port on the host computer.\n'
+        printf 'port=%s\n\n' "$initial_port"
+        printf '# Optional explicit Steam root on this client. This takes precedence over discovery.\n'
+        printf '# client_steam_path=/home/USERNAME/.local/share/Steam\n\n'
+        printf '# Optional numeric userdata ID. When omitted, every ID present on both systems is synced.\n'
+        printf '# steam_user_id=123456789\n\n'
+        printf '# Optional conflict policy: preserve-client or host-wins. The default is preserve-client.\n'
+        printf '# conflict_policy=preserve-client\n\n'
+        printf '# Optional Steam restart policy: ask, always, or never. The default is ask.\n'
+        printf '# restart_policy=ask\n\n'
+        printf '# Optional SSH connection timeout in seconds. The default is 7.\n'
+        printf '# connect_timeout=7\n'
+    } >"$temporary_config"
+    chmod 0600 "$temporary_config"
+    mv -- "$temporary_config" "$CONFIG_FILE" || fail 2 "Could not install configuration at $CONFIG_FILE."
+}
+
+init_config() {
+    local initial_host initial_user initial_port
+    if [[ -e "$CONFIG_FILE" ]]; then
+        fail 2 "Configuration already exists at $CONFIG_FILE. It was not changed; edit that file directly."
+    fi
+    [[ "$MODE" != "headless" ]] || fail 2 "The init command is interactive and cannot run in non-interactive mode."
+    if [[ "$MODE" == "gui" ]]; then
+        initial_host="$(gui_entry "$PROGRAM_NAME setup" "Windows or Linux host name/address:" "")" || exit 1
+        initial_user="$(gui_entry "$PROGRAM_NAME setup" "SSH username on the host:" "")" || exit 1
+        initial_port="$(gui_entry "$PROGRAM_NAME setup" "SSH port:" "22")" || exit 1
+    else
+        printf 'Host name or address: '; IFS= read -r initial_host
+        printf 'SSH username: '; IFS= read -r initial_user
+        printf 'SSH port [22]: '; IFS= read -r initial_port; initial_port="${initial_port:-22}"
+    fi
+    initial_host="$(trim_value "$initial_host")"
+    initial_user="$(trim_value "$initial_user")"
+    initial_port="$(trim_value "$initial_port")"
+    [[ -n "$initial_host" ]] || fail 2 "Host name/address is required."
+    [[ -n "$initial_user" ]] || fail 2 "SSH username is required."
+    [[ "$initial_port" =~ ^[0-9]+$ ]] && ((initial_port >= 1 && initial_port <= 65535)) || fail 2 "SSH port must be between 1 and 65535."
+    write_initial_config "$initial_host" "$initial_user" "$initial_port"
+    show_info "Configuration created at:
+$CONFIG_FILE
+
+Start Steam on the host before the first connection. The detected host platform and Steam path will be saved on this client automatically."
+}
+
+if [[ "$COMMAND" == "ssh-help" ]]; then show_ssh_help; exit 0; fi
+if [[ "$COMMAND" == "init" ]]; then init_config; exit 0; fi
+if [[ "$COMMAND" == "show-config" ]]; then
+    [[ -f "$CONFIG_FILE" ]] || fail 2 "Configuration does not exist at $CONFIG_FILE. Run '$PROGRAM_COMMAND init'."
+    printf 'Configuration: %s\n\n' "$CONFIG_FILE"
+    cat -- "$CONFIG_FILE"
+    exit 0
+fi
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    if [[ "$MODE" == "gui" ]]; then
+        if confirm_action "No configuration exists at:
+$CONFIG_FILE
+
+Create it now?" "Set Up" "Cancel"; then init_config; else exit 2; fi
+    elif [[ -z "$CLI_HOST" && -z "${STEAM_GRID_HOST:-}" ]]; then
+        fail 2 "Configuration does not exist at $CONFIG_FILE. Run '$PROGRAM_COMMAND init', or supply connection options explicitly."
+    fi
+fi
+[[ -f "$CONFIG_FILE" ]] && load_config
+
+[[ -z "$CFG_CONFIG_VERSION" || "$CFG_CONFIG_VERSION" == "1" ]] || fail 2 "Unsupported config_version in $CONFIG_FILE."
+if [[ "$COMMAND" == "connection-settings" ]]; then connection_settings_menu; fi
+
+REMOTE_HOST="${CLI_HOST:-${STEAM_GRID_HOST:-${CFG_HOST:-}}}"
+REMOTE_USER="${CLI_USER:-${STEAM_GRID_USER:-${CFG_USER:-}}}"
+REMOTE_PORT="${CLI_PORT:-${STEAM_GRID_PORT:-${CFG_PORT:-22}}}"
+HOST_PLATFORM="${CLI_HOST_PLATFORM:-${STEAM_GRID_HOST_PLATFORM:-${CFG_HOST_PLATFORM:-auto}}}"
+WINDOWS_HOST_STEAM_PATH="${CLI_WINDOWS_HOST_STEAM_PATH:-${STEAM_GRID_WINDOWS_HOST_STEAM_PATH:-${CFG_WINDOWS_HOST_STEAM_PATH:-}}}"
+LINUX_HOST_STEAM_PATH="${CLI_LINUX_HOST_STEAM_PATH:-${STEAM_GRID_LINUX_HOST_STEAM_PATH:-${CFG_LINUX_HOST_STEAM_PATH:-}}}"
+CLIENT_STEAM_PATH="${CLI_CLIENT_STEAM_PATH:-${STEAM_GRID_CLIENT_STEAM_PATH:-${CFG_CLIENT_STEAM_PATH:-}}}"
+STEAM_USER_ID="${CLI_STEAM_USER_ID:-${STEAM_GRID_USER_ID:-${CFG_STEAM_USER_ID:-}}}"
+CONFLICT_POLICY="${CLI_CONFLICT_POLICY:-${STEAM_GRID_CONFLICT_POLICY:-${CFG_CONFLICT_POLICY:-preserve-client}}}"
+RESTART_POLICY="${RESTART_OVERRIDE:-${CLI_RESTART_POLICY:-${STEAM_GRID_RESTART_POLICY:-${CFG_RESTART_POLICY:-ask}}}}"
+CONNECT_TIMEOUT="${CLI_CONNECT_TIMEOUT:-${STEAM_GRID_CONNECT_TIMEOUT:-${CFG_CONNECT_TIMEOUT:-7}}}"
+
+[[ -n "$REMOTE_HOST" ]] || fail 2 "Host is missing. Run '$PROGRAM_COMMAND init' or use --host."
+[[ -n "$REMOTE_USER" ]] || fail 2 "SSH user is missing. Run '$PROGRAM_COMMAND init' or use --user."
+[[ "$REMOTE_PORT" =~ ^[0-9]+$ ]] && ((REMOTE_PORT >= 1 && REMOTE_PORT <= 65535)) || fail 2 "SSH port must be between 1 and 65535."
+[[ "$CONNECT_TIMEOUT" =~ ^[0-9]+$ ]] && ((CONNECT_TIMEOUT >= 1)) || fail 2 "Connection timeout must be a positive integer."
+[[ "$HOST_PLATFORM" == "auto" || "$HOST_PLATFORM" == "windows" || "$HOST_PLATFORM" == "linux" ]] || fail 2 "Host platform must be auto, windows, or linux."
+[[ "$CONFLICT_POLICY" == "preserve-client" || "$CONFLICT_POLICY" == "host-wins" ]] || fail 2 "Conflict policy must be preserve-client or host-wins."
+[[ "$RESTART_POLICY" == "ask" || "$RESTART_POLICY" == "always" || "$RESTART_POLICY" == "never" ]] || fail 2 "Restart policy must be ask, always, or never."
+[[ -z "$STEAM_USER_ID" || "$STEAM_USER_ID" =~ ^[0-9]+$ ]] || fail 2 "Steam user ID must contain only digits."
+[[ "$REMOTE_HOST" != *$'\n'* && "$REMOTE_USER" != *$'\n'* ]] || fail 2 "Invalid host or user setting."
+[[ "$WINDOWS_HOST_STEAM_PATH" != *$'\n'* && "$WINDOWS_HOST_STEAM_PATH" != *'"'* ]] || fail 2 "Windows host Steam path contains unsupported characters."
+[[ "$LINUX_HOST_STEAM_PATH" != *$'\n'* && "$LINUX_HOST_STEAM_PATH" != *'"'* ]] || fail 2 "Linux host Steam path contains unsupported characters."
+[[ "$MODE" != "headless" || "$RESTART_POLICY" != "ask" ]] || RESTART_POLICY="never"
+
+if [[ "$COMMAND" == "sync" && "$MODE" == "gui" ]]; then
+    if ! confirm_action "Steam Artwork Sync will securely connect to:
+
+User: $REMOTE_USER
+Host: $REMOTE_HOST:$REMOTE_PORT
+
+It will read Steam artwork from that computer and copy missing artwork to this Linux client. Existing client artwork is preserved unless host-wins was explicitly configured. If authentication is needed, the next window will ask for this host account’s password.
+
+Continue?" "Start Sync" "Cancel"; then
+        exit 0
+    fi
+fi
+
+cleanup() {
+    progress_stop
+    if ((MASTER_STARTED)) && [[ -n "$CONTROL_SOCKET" ]]; then
+        ssh -o ControlPath="$CONTROL_SOCKET" -o Port="$REMOTE_PORT" -O exit "$REMOTE_USER@$REMOTE_HOST" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$WORK_DIR" && "$WORK_DIR" == /tmp/steam-grid-sync.* && -d "$WORK_DIR" ]]; then
+        rm -rf -- "$WORK_DIR"
+    elif [[ -n "$WORK_DIR" && -n "${XDG_RUNTIME_DIR:-}" && "$WORK_DIR" == "$XDG_RUNTIME_DIR"/steam-grid-sync.* && -d "$WORK_DIR" ]]; then
+        rm -rf -- "$WORK_DIR"
+    fi
+}
+trap cleanup EXIT HUP INT TERM
+
+for required in ssh sftp ssh-keyscan ssh-keygen mktemp cp mv cmp sort find; do command -v "$required" >/dev/null 2>&1 || fail 2 "Required command is missing: $required"; done
+runtime_base="/tmp"
+if [[ -n "${XDG_RUNTIME_DIR:-}" && "$XDG_RUNTIME_DIR" == /* && -d "$XDG_RUNTIME_DIR" ]]; then runtime_base="$XDG_RUNTIME_DIR"; fi
+WORK_DIR="$(mktemp -d "$runtime_base/steam-grid-sync.XXXXXX")" || fail 6 "Could not create a temporary working directory."
+CONTROL_SOCKET="$WORK_DIR/ssh-control"
+TARGET="$REMOTE_USER@$REMOTE_HOST"
+
+ssh_common_options=(-o "Port=$REMOTE_PORT" -o "ConnectTimeout=$CONNECT_TIMEOUT" \
+    -o "UserKnownHostsFile=$KNOWN_HOSTS_FILE" -o GlobalKnownHostsFile=/dev/null \
+    -o StrictHostKeyChecking=yes -o KbdInteractiveAuthentication=no)
+
+host_lookup_name() {
+    if [[ "$REMOTE_PORT" == "22" ]]; then printf '%s' "$REMOTE_HOST"; else printf '[%s]:%s' "$REMOTE_HOST" "$REMOTE_PORT"; fi
+}
+
+fingerprint_from_key_file() {
+    local key_file="$1" preferred="$WORK_DIR/preferred-host-key"
+    if grep -m1 ' ssh-ed25519 ' "$key_file" >"$preferred"; then :; else grep -v '^#' "$key_file" | head -n 1 >"$preferred"; fi
+    [[ -s "$preferred" ]] || return 1
+    ssh-keygen -lf "$preferred" | awk 'NR == 1 { print $2 }'
+}
+
+host_key_preflight() {
+    local lookup known_lines="$WORK_DIR/known-host-lines" known_keys="$WORK_DIR/known-host-values"
+    local scanned_keys="$WORK_DIR/scanned-host-values" intersection="$WORK_DIR/host-key-intersection"
+    local old_fingerprint backup known_hosts_dir
+    lookup="$(host_lookup_name)"
+    known_hosts_dir="${KNOWN_HOSTS_FILE%/*}"
+    [[ "$known_hosts_dir" != "$KNOWN_HOSTS_FILE" ]] || known_hosts_dir="."
+    mkdir -p -- "$known_hosts_dir" || fail 6 "Could not create trusted-host directory: $known_hosts_dir"
+    touch "$KNOWN_HOSTS_FILE" || fail 6 "Could not access trusted-host file: $KNOWN_HOSTS_FILE"
+    chmod 0600 "$KNOWN_HOSTS_FILE" 2>/dev/null || true
+    if ! ssh-keyscan -T "$CONNECT_TIMEOUT" -p "$REMOTE_PORT" -t ed25519,ecdsa,rsa "$REMOTE_HOST" >"$WORK_DIR/scanned-host-keys" 2>"$WORK_DIR/keyscan.err"; then
+        :
+    fi
+    if [[ ! -s "$WORK_DIR/scanned-host-keys" ]]; then
+        if [[ "$COMMAND" == "show-fingerprint" ]]; then
+            ssh-keygen -F "$lookup" -f "$KNOWN_HOSTS_FILE" 2>/dev/null | grep -v '^#' >"$known_lines" || true
+            if [[ -s "$known_lines" ]]; then
+                old_fingerprint="$(fingerprint_from_key_file "$known_lines" 2>/dev/null || printf unknown)"
+                show_info "Trusted fingerprint for $REMOTE_HOST:$REMOTE_PORT:
+$old_fingerprint
+
+The host is not currently answering, so its presented identity could not be compared."
+                exit 0
+            fi
+        fi
+        fail 3 "No SSH server answered at $REMOTE_HOST:$REMOTE_PORT.
+
+Make sure the host is on, reachable, and has SSH Server installed and running. Open Connection Settings → SSH Server help for setup instructions."
+    fi
+    CURRENT_HOST_FINGERPRINT="$(fingerprint_from_key_file "$WORK_DIR/scanned-host-keys")" || fail 3 "The SSH server did not offer a usable host identity."
+    mv -- "$WORK_DIR/preferred-host-key" "$WORK_DIR/presented-host-key" || fail 3 "Could not save the presented SSH host identity."
+    ssh-keygen -F "$lookup" -f "$KNOWN_HOSTS_FILE" 2>/dev/null | grep -v '^#' >"$known_lines" || true
+    if [[ ! -s "$known_lines" ]]; then
+        [[ "$MODE" != "headless" ]] || fail 3 "The SSH identity for $REMOTE_HOST is not trusted. Run an interactive connection first. Presented fingerprint: $CURRENT_HOST_FINGERPRINT"
+        if ! confirm_action "First connection to $REMOTE_HOST:$REMOTE_PORT.
+
+SSH fingerprint:
+$CURRENT_HOST_FINGERPRINT
+
+Trust this host and continue? Only approve this if this is the computer you intended to reach." "Trust and Continue" "Cancel"; then
+            exit 3
+        fi
+        cat "$WORK_DIR/presented-host-key" >>"$KNOWN_HOSTS_FILE" || fail 3 "Could not save the trusted SSH host identity."
+        return
+    fi
+    awk '!/^#/ { print $2 " " $3 }' "$known_lines" | sort -u >"$known_keys"
+    awk '!/^#/ { print $2 " " $3 }' "$WORK_DIR/scanned-host-keys" | sort -u >"$scanned_keys"
+    comm -12 "$known_keys" "$scanned_keys" >"$intersection"
+    [[ -s "$intersection" ]] && return
+    old_fingerprint="$(fingerprint_from_key_file "$known_lines" 2>/dev/null || printf unknown)"
+    [[ "$MODE" != "headless" ]] || fail 3 "The SSH identity for $REMOTE_HOST changed. Refusing the connection. Old: $old_fingerprint New: $CURRENT_HOST_FINGERPRINT"
+    if ! confirm_action "WARNING: the SSH identity for $REMOTE_HOST changed.
+
+Previously trusted: $old_fingerprint
+Presented now:      $CURRENT_HOST_FINGERPRINT
+
+This can happen after reinstalling SSH or replacing the computer, but can also indicate interception. Replace it only after verifying the new fingerprint on the host." "I Verified — Replace" "Cancel"; then
+        exit 3
+    fi
+    backup="$KNOWN_HOSTS_FILE.backup-$(date +%Y%m%d-%H%M%S)"
+    cp -p -- "$KNOWN_HOSTS_FILE" "$backup" || fail 6 "Could not back up trusted-host file."
+    ssh-keygen -R "$lookup" -f "$KNOWN_HOSTS_FILE" >/dev/null || fail 6 "Could not replace the old host identity."
+    cat "$WORK_DIR/presented-host-key" >>"$KNOWN_HOSTS_FILE" || fail 3 "Could not save the trusted SSH host identity."
+}
+
+host_key_preflight
+
+load_state || true
+if [[ "$STATE_VERSION" == "1" && "$STATE_HOST" == "$REMOTE_HOST" && "$STATE_USER" == "$REMOTE_USER" && "$STATE_PORT" == "$REMOTE_PORT" && "$STATE_HOST_KEY_FINGERPRINT" == "$CURRENT_HOST_FINGERPRINT" && ( "$STATE_HOST_PLATFORM" == "windows" || "$STATE_HOST_PLATFORM" == "linux" ) && -n "$STATE_HOST_STEAM_PATH" ]]; then
+    STATE_VALID=1
+fi
+
+if [[ "$COMMAND" == "show-fingerprint" ]]; then
+    show_info "Host: $REMOTE_HOST:$REMOTE_PORT
+Fingerprint: $CURRENT_HOST_FINGERPRINT
+Trusted-host file: $KNOWN_HOSTS_FILE"
+    exit 0
+fi
+
+test_dedicated_key() {
+    [[ -f "$KEY_FILE" && -f "$KEY_FILE.pub" ]] || return 1
+    printf 'quit\n' >"$WORK_DIR/key-test.batch"
+    sftp -q -b "$WORK_DIR/key-test.batch" "${ssh_common_options[@]}" \
+        -o BatchMode=yes -o IdentitiesOnly=yes -o ControlMaster=no -o ControlPath=none \
+        -o "IdentityFile=$KEY_FILE" "$TARGET" \
+        >"$WORK_DIR/key-test.out" 2>"$WORK_DIR/key-test.err"
+}
+
+if ((STATE_VALID)) && [[ "$COMMAND" != "setup-key" && "$COMMAND" != "remove-key" ]]; then
+    if test_dedicated_key; then DEDICATED_KEY_WORKS=1; else [[ -f "$KEY_FILE" ]] && DEDICATED_KEY_BROKEN=1; fi
+fi
+
+ssh_options=(-o "ControlPath=$CONTROL_SOCKET" -o ControlMaster=yes -o ControlPersist=no \
+    -o ServerAliveInterval=15 -o ServerAliveCountMax=2 "${ssh_common_options[@]}")
+if ((DEDICATED_KEY_WORKS)); then
+    CONNECTION_USES_DEDICATED_KEY=1
+    ssh_options+=(-o BatchMode=yes -o NumberOfPasswordPrompts=0 -o PreferredAuthentications=publickey \
+        -o IdentitiesOnly=yes -o "IdentityFile=$KEY_FILE")
+elif [[ "$MODE" == "headless" ]]; then
+    ssh_options+=(-o BatchMode=yes -o NumberOfPasswordPrompts=0 -o PreferredAuthentications=publickey)
+else
+    ssh_options+=(-o NumberOfPasswordPrompts=1 -o PreferredAuthentications=publickey,password)
+fi
+
+connect_result=0
+if [[ "$MODE" == "gui" && "$CONNECTION_USES_DEDICATED_KEY" -eq 0 ]]; then
+    STEAM_GRID_ASKPASS_HELPER=1 STEAM_GRID_ASKPASS_USER="$REMOTE_USER" \
+        STEAM_GRID_ASKPASS_HOST="$REMOTE_HOST:$REMOTE_PORT" \
+        SSH_ASKPASS="$script_path" SSH_ASKPASS_REQUIRE=force \
+        ssh "${ssh_options[@]}" -fN "$TARGET" </dev/null 2>"$WORK_DIR/connect.err" || connect_result=$?
+else
+    ssh "${ssh_options[@]}" -fN "$TARGET" 2>"$WORK_DIR/connect.err" || connect_result=$?
+fi
+if ((connect_result != 0)); then
+    if grep -qi 'permission denied\|authentication failed' "$WORK_DIR/connect.err"; then
+        fail 3 "SSH authentication was rejected for $REMOTE_USER@$REMOTE_HOST.
+
+Use the host account password. On Windows, a Windows Hello PIN is not accepted. If passwordless access was previously configured, open Connection Settings and repair it."
+    fi
+    fail 3 "Could not establish SSH with $REMOTE_HOST. The host answered, but the secure session failed.
+
+Open Connection Settings → Test Connection for details or SSH Server help for setup guidance."
+fi
+MASTER_STARTED=1
+progress_start "Connected to $REMOTE_HOST. Preparing the artwork sync…"
+
+shared_ssh_options=(-o "ControlPath=$CONTROL_SOCKET" -o ControlMaster=no -o BatchMode=yes "${ssh_common_options[@]}")
+remote_command() { ssh "${shared_ssh_options[@]}" "$TARGET" "$1"; }
+
+detect_host_platform() {
+    local output
+    if [[ "$HOST_PLATFORM" != "auto" ]]; then printf '%s' "$HOST_PLATFORM"; return; fi
+    output="$(remote_command 'cmd.exe /d /c ver' 2>/dev/null || true)"
+    if [[ "$output" == *Windows* ]]; then printf 'windows'; return; fi
+    output="$(remote_command 'uname -s' 2>/dev/null || true)"
+    if [[ "$output" == Linux* ]]; then printf 'linux'; return; fi
+    return 1
+}
+
+discover_windows_steam_root() {
+    command -v iconv >/dev/null 2>&1 || return 1
+    command -v base64 >/dev/null 2>&1 || return 1
+    local powershell_script encoded output
+    powershell_script='$ErrorActionPreference = "Stop"
+$process = Get-Process -Name steam -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($process -and $process.Path) {
+    $root = Split-Path -Parent $process.Path
+    if (Test-Path -LiteralPath (Join-Path $root "userdata")) { [Console]::Out.WriteLine($root); exit 0 }
+}
+[Console]::Error.WriteLine("Steam is not running or its userdata directory could not be found.")
+exit 1'
+    encoded="$(printf '%s' "$powershell_script" | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\n')"
+    output="$(remote_command "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded" 2>"$WORK_DIR/windows-discovery.err")" || return 1
+    output="${output%$'\r'}"
+    [[ -n "$output" ]] || return 1
+    printf '%s' "${output//\\//}"
+}
+
+discover_linux_steam_root() {
+    local output
+    output="$(remote_command 'sh -s' <<'REMOTE_SCRIPT'
+valid_root() { case "$1" in /*) [ -d "$1/userdata" ] ;; *) return 1 ;; esac; }
+if command -v pgrep >/dev/null 2>&1; then
+    pid="$(pgrep -n -x steam 2>/dev/null || true)"
+    if [ -n "$pid" ]; then
+        cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)"
+        exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+        process_home="$(tr '\000' '\n' <"/proc/$pid/environ" 2>/dev/null | sed -n 's/^HOME=//p' | head -n 1)"
+        flatpak_id="$(tr '\000' '\n' <"/proc/$pid/environ" 2>/dev/null | sed -n 's/^FLATPAK_ID=//p' | head -n 1)"
+        snap_user_common="$(tr '\000' '\n' <"/proc/$pid/environ" 2>/dev/null | sed -n 's/^SNAP_USER_COMMON=//p' | head -n 1)"
+        compat_root="$(tr '\000' '\n' <"/proc/$pid/environ" 2>/dev/null | sed -n 's/^STEAM_COMPAT_CLIENT_INSTALL_PATH=//p' | head -n 1)"
+        flatpak_root=""
+        snap_root=""
+        [ -z "$flatpak_id" ] || flatpak_root="$process_home/.var/app/$flatpak_id/.local/share/Steam"
+        [ -z "$snap_user_common" ] || snap_root="$snap_user_common/.local/share/Steam"
+        for candidate in "$cwd" "$(dirname "$exe" 2>/dev/null)" "$(dirname "$(dirname "$exe" 2>/dev/null)" 2>/dev/null)" "$compat_root" "$flatpak_root" "$snap_root"; do
+            if valid_root "$candidate"; then printf '%s\n' "$(readlink -f "$candidate")"; exit 0; fi
+        done
+    fi
+fi
+printf '%s\n' 'Steam is not running or its userdata directory could not be found.' >&2
+exit 1
+REMOTE_SCRIPT
+)" || return 1
+    output="${output%$'\r'}"
+    [[ -n "$output" ]] || return 1
+    printf '%s' "$output"
+}
+
+discover_client_steam_root() {
+    local pid cwd exe candidate
+    if command -v pgrep >/dev/null 2>&1; then
+        pid="$(pgrep -n -x steam 2>/dev/null || true)"
+        if [[ -n "$pid" ]]; then
+            cwd="$(readlink -f "/proc/$pid/cwd" 2>/dev/null || true)"
+            exe="$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)"
+            for candidate in "$cwd" "$(dirname "$exe" 2>/dev/null)" "$(dirname "$(dirname "$exe" 2>/dev/null)" 2>/dev/null)"; do
+                if [[ -n "$candidate" && -d "$candidate/userdata" ]]; then readlink -f "$candidate"; return 0; fi
+            done
+        fi
+    fi
+    for candidate in "$HOME/.steam/root" "$HOME/.local/share/Steam" "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam"; do
+        if [[ -d "$candidate/userdata" ]]; then readlink -f "$candidate"; return 0; fi
+    done
+    return 1
+}
+
+ensure_client_identity() {
+    local client_dir
+    client_dir="${CLIENT_ID_FILE%/*}"
+    umask 077
+    mkdir -p -- "$client_dir" "$KEY_DIR" || fail 6 "Could not create the passwordless-access directory."
+    if [[ ! -s "$CLIENT_ID_FILE" ]]; then
+        command -v od >/dev/null 2>&1 || fail 2 "Required command is missing: od"
+        od -An -N16 -tx1 /dev/urandom | tr -d ' \n' >"$CLIENT_ID_FILE"
+        chmod 0600 "$CLIENT_ID_FILE"
+    fi
+    CLIENT_ID="$(tr -cd 'a-fA-F0-9-' <"$CLIENT_ID_FILE")"
+    [[ -n "$CLIENT_ID" ]] || fail 6 "The client identity file is invalid: $CLIENT_ID_FILE"
+    KEY_MARKER="steam-grid-sync:$CLIENT_ID"
+}
+
+run_windows_powershell() {
+    local powershell_script="$1" encoded
+    command -v iconv >/dev/null 2>&1 || return 1
+    command -v base64 >/dev/null 2>&1 || return 1
+    encoded="$(printf '%s' "$powershell_script" | iconv -f UTF-8 -t UTF-16LE | base64 | tr -d '\n')"
+    remote_command "powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded"
+}
+
+install_managed_key_windows() {
+    local authorized_line="$1" marker="$2" line64 marker64 powershell_script
+    line64="$(printf '%s' "$authorized_line" | base64 | tr -d '\n')"
+    marker64="$(printf '%s' "$marker" | base64 | tr -d '\n')"
+    powershell_script='$ErrorActionPreference = "Stop"
+$line = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("'"$line64"'"))
+$marker = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("'"$marker64"'"))
+$principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+$isAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if ($isAdmin) {
+    $path = Join-Path $env:ProgramData "ssh\administrators_authorized_keys"
+} else {
+    $path = Join-Path $env:USERPROFILE ".ssh\authorized_keys"
+}
+$directory = Split-Path -Parent $path
+New-Item -ItemType Directory -Force -Path $directory | Out-Null
+$existing = @()
+if (Test-Path -LiteralPath $path) {
+    Copy-Item -LiteralPath $path -Destination ($path + ".steam-grid-sync.backup") -Force
+    $existing = @(Get-Content -LiteralPath $path)
+}
+$kept = @($existing | Where-Object { $_ -notlike ("*" + $marker) })
+Set-Content -LiteralPath $path -Value @($kept + $line) -Encoding Ascii
+if ($isAdmin) {
+    & icacls.exe $path /inheritance:r /grant:r "*S-1-5-32-544:(F)" "*S-1-5-18:(F)" | Out-Null
+} else {
+    $userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    & icacls.exe $path /inheritance:r /grant:r ("*" + $userSid + ":(F)") "*S-1-5-18:(F)" | Out-Null
+}
+[Console]::Out.WriteLine($path)'
+    run_windows_powershell "$powershell_script"
+}
+
+remove_managed_key_windows() {
+    local marker="$1" marker64 powershell_script
+    marker64="$(printf '%s' "$marker" | base64 | tr -d '\n')"
+    powershell_script='$ErrorActionPreference = "Stop"
+$marker = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("'"$marker64"'"))
+$principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+$isAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if ($isAdmin) { $path = Join-Path $env:ProgramData "ssh\administrators_authorized_keys" }
+else { $path = Join-Path $env:USERPROFILE ".ssh\authorized_keys" }
+if (Test-Path -LiteralPath $path) {
+    Copy-Item -LiteralPath $path -Destination ($path + ".steam-grid-sync.backup") -Force
+    $kept = @(Get-Content -LiteralPath $path | Where-Object { $_ -notlike ("*" + $marker) })
+    Set-Content -LiteralPath $path -Value $kept -Encoding Ascii
+}
+[Console]::Out.WriteLine($path)'
+    run_windows_powershell "$powershell_script"
+}
+
+install_managed_key_linux() {
+    local authorized_line="$1" marker="$2" line64 marker64
+    line64="$(printf '%s' "$authorized_line" | base64 | tr -d '\n')"
+    marker64="$(printf '%s' "$marker" | base64 | tr -d '\n')"
+    remote_command "sh -s -- '$line64' '$marker64'" <<'REMOTE_INSTALL_KEY'
+set -eu
+line="$(printf '%s' "$1" | base64 -d)"
+marker="$(printf '%s' "$2" | base64 -d)"
+mkdir -p "$HOME/.ssh"
+chmod 700 "$HOME/.ssh"
+path="$HOME/.ssh/authorized_keys"
+touch "$path"
+cp -p "$path" "$path.steam-grid-sync.backup"
+temporary="$(mktemp "$HOME/.ssh/.authorized_keys.XXXXXX")"
+awk -v marker="$marker" 'index($0, marker) == 0' "$path" >"$temporary"
+printf '%s\n' "$line" >>"$temporary"
+chmod 600 "$temporary"
+mv "$temporary" "$path"
+printf '%s\n' "$path"
+REMOTE_INSTALL_KEY
+}
+
+remove_managed_key_linux() {
+    local marker="$1" marker64
+    marker64="$(printf '%s' "$marker" | base64 | tr -d '\n')"
+    remote_command "sh -s -- '$marker64'" <<'REMOTE_REMOVE_KEY'
+set -eu
+marker="$(printf '%s' "$1" | base64 -d)"
+path="$HOME/.ssh/authorized_keys"
+if [ -f "$path" ]; then
+    cp -p "$path" "$path.steam-grid-sync.backup"
+    temporary="$(mktemp "$HOME/.ssh/.authorized_keys.XXXXXX")"
+    awk -v marker="$marker" 'index($0, marker) == 0' "$path" >"$temporary"
+    chmod 600 "$temporary"
+    mv "$temporary" "$path"
+fi
+printf '%s\n' "$path"
+REMOTE_REMOVE_KEY
+}
+
+remove_managed_key_remote() {
+    local platform="$1" marker="$2"
+    case "$platform" in
+        windows) remove_managed_key_windows "$marker" ;;
+        linux) remove_managed_key_linux "$marker" ;;
+        *) return 1 ;;
+    esac
+}
+
+setup_restricted_key() {
+    local key_type key_data unused authorized_line remote_key_file sftp_server generated=0
+    ensure_client_identity
+    progress_update "Checking the managed passwordless key…"
+    if test_dedicated_key; then
+        show_info "Passwordless access is already enabled and working for $REMOTE_HOST."
+        return 0
+    fi
+    command -v ssh-keygen >/dev/null 2>&1 || fail 2 "Required command is missing: ssh-keygen"
+    if [[ ! -f "$KEY_FILE" || ! -f "$KEY_FILE.pub" ]]; then
+        rm -f -- "$KEY_FILE" "$KEY_FILE.pub"
+        ssh-keygen -q -t ed25519 -N '' -C "$KEY_MARKER" -f "$KEY_FILE" || fail 6 "Could not generate the dedicated SSH key."
+        chmod 0600 "$KEY_FILE"; chmod 0644 "$KEY_FILE.pub"
+        generated=1
+    fi
+    read -r key_type key_data unused <"$KEY_FILE.pub"
+    [[ "$key_type" == "ssh-ed25519" && -n "$key_data" ]] || fail 6 "The dedicated public key is invalid."
+    case "$RESOLVED_HOST_PLATFORM" in
+        windows)
+            progress_update "Installing the restricted read-only key on Windows…"
+            authorized_line="restrict,command=\"C:/Windows/System32/OpenSSH/sftp-server.exe -R\" $key_type $key_data $KEY_MARKER"
+            remote_key_file="$(install_managed_key_windows "$authorized_line" "$KEY_MARKER")" || fail 6 "Could not install the managed key on Windows. The SSH account may lack permission to update its authorized-keys file."
+            ;;
+        linux)
+            progress_update "Installing the restricted read-only key on Linux…"
+            sftp_server="$(remote_command 'for candidate in /usr/lib/openssh/sftp-server /usr/lib/ssh/sftp-server /usr/libexec/openssh/sftp-server; do if [ -x "$candidate" ]; then printf "%s\n" "$candidate"; exit 0; fi; done; command -v sftp-server 2>/dev/null' 2>/dev/null)" || true
+            [[ -n "$sftp_server" ]] || fail 6 "Could not locate sftp-server on the Linux host."
+            authorized_line="restrict,command=\"$sftp_server -R\" $key_type $key_data $KEY_MARKER"
+            remote_key_file="$(install_managed_key_linux "$authorized_line" "$KEY_MARKER")" || fail 6 "Could not install the managed key on Linux."
+            ;;
+    esac
+    if ! test_dedicated_key; then
+        remove_managed_key_remote "$RESOLVED_HOST_PLATFORM" "$KEY_MARKER" >/dev/null 2>&1 || true
+        ((generated)) && rm -f -- "$KEY_FILE" "$KEY_FILE.pub"
+        fail 6 "The restricted key was installed but did not pass its read-only SFTP test. Its remote authorization was rolled back."
+    fi
+    remote_key_file="${remote_key_file%$'\r'}"
+    remote_key_file="${remote_key_file//\\//}"
+    DEDICATED_KEY_WORKS=1
+    DEDICATED_KEY_BROKEN=0
+    show_info "Passwordless artwork access is enabled.
+
+The dedicated key cannot open a terminal, choose commands, forward connections, or modify host files. It is forced to read-only SFTP. It can read files available to this SSH account; it is not confined to Steam directories.
+
+Remote authorization: $remote_key_file"
+}
+
+remove_restricted_key() {
+    local platform
+    [[ -s "$CLIENT_ID_FILE" ]] || { show_info "No managed passwordless key is recorded on this client."; return 0; }
+    ensure_client_identity
+    progress_update "Removing the managed passwordless key…"
+    platform="$STATE_HOST_PLATFORM"
+    if [[ "$platform" != "windows" && "$platform" != "linux" ]]; then platform="$(detect_host_platform)" || fail 4 "Could not detect the host platform for key removal."; fi
+    remove_managed_key_remote "$platform" "$KEY_MARKER" >/dev/null || fail 6 "Could not remove the managed key from the host."
+    rm -f -- "$KEY_FILE" "$KEY_FILE.pub"
+    show_info "Passwordless artwork access was removed from the host and the dedicated local key was deleted."
+}
+
+if [[ "$COMMAND" == "remove-key" ]]; then remove_restricted_key; exit 0; fi
+
+discover_host_details() {
+    local discovered_root=""
+    progress_update "Detecting the host operating system…"
+    RESOLVED_HOST_PLATFORM="$(detect_host_platform)" || fail 4 "Could not detect whether the host runs Windows or Linux."
+    while [[ -z "$discovered_root" ]]; do
+        progress_update "Locating the running Steam installation on the $RESOLVED_HOST_PLATFORM host…"
+        case "$RESOLVED_HOST_PLATFORM" in
+            windows)
+                if [[ -n "$WINDOWS_HOST_STEAM_PATH" ]]; then discovered_root="${WINDOWS_HOST_STEAM_PATH//\\//}"; else discovered_root="$(discover_windows_steam_root || true)"; fi
+                ;;
+            linux)
+                if [[ -n "$LINUX_HOST_STEAM_PATH" ]]; then discovered_root="$LINUX_HOST_STEAM_PATH"; else discovered_root="$(discover_linux_steam_root || true)"; fi
+                ;;
+        esac
+        [[ -n "$discovered_root" ]] && break
+        if [[ "$MODE" == "gui" ]] && confirm_action "Steam could not be detected on $REMOTE_HOST.
+
+Start Steam on the host computer, wait until it has opened, and choose Retry." "Retry" "Cancel"; then
+            progress_start "Trying Steam discovery again…"
+            continue
+        fi
+        fail 4 "Steam is not running on the host or its userdata directory could not be detected. Start Steam there and try again."
+    done
+    HOST_STEAM_ROOT="${discovered_root%/}"
+}
+
+if ((STATE_VALID)); then
+    progress_update "Using the previously verified Steam location…"
+    RESOLVED_HOST_PLATFORM="$STATE_HOST_PLATFORM"
+    HOST_STEAM_ROOT="${STATE_HOST_STEAM_PATH%/}"
+else
+    ((CONNECTION_USES_DEDICATED_KEY == 0)) || fail 4 "Saved host discovery is unavailable, and the restricted key cannot run discovery commands. Repair the connection using a password."
+    discover_host_details
+fi
+HOST_STEAM_ROOT="${HOST_STEAM_ROOT%/}"
+HOST_SFTP_STEAM_ROOT="$HOST_STEAM_ROOT"
+if [[ "$RESOLVED_HOST_PLATFORM" == "windows" && "$HOST_SFTP_STEAM_ROOT" =~ ^[A-Za-z]:/ ]]; then
+    HOST_SFTP_STEAM_ROOT="/$HOST_SFTP_STEAM_ROOT"
+fi
+if [[ -n "$CLIENT_STEAM_PATH" ]]; then
+    CLIENT_STEAM_ROOT="${CLIENT_STEAM_PATH%/}"
+    [[ -d "$CLIENT_STEAM_ROOT/userdata" ]] || fail 4 "Configured client Steam path has no userdata directory: $CLIENT_STEAM_ROOT"
+else
+    CLIENT_STEAM_ROOT="$(discover_client_steam_root)" || fail 4 "Could not find Steam on this Linux client. Start Steam or set client_steam_path in $CONFIG_FILE."
+fi
+
+sftp_list_directory() {
+    local remote_path="$1" output_file="$2" error_file="$3" batch_file="$4"
+    [[ "$remote_path" != *$'\n'* && "$remote_path" != *'"'* ]] || return 1
+    printf 'cd "%s"\nls -1\n' "$remote_path" >"$batch_file"
+    sftp -q "${shared_ssh_options[@]}" -b "$batch_file" "$TARGET" >"$output_file" 2>"$error_file"
+}
+
+REMOTE_USERDATA="$HOST_SFTP_STEAM_ROOT/userdata"
+progress_update "Reading Steam users from the host…"
+if ! sftp_list_directory "$REMOTE_USERDATA" "$WORK_DIR/remote-users.out" "$WORK_DIR/remote-users.err" "$WORK_DIR/remote-users.batch"; then
+    detail="$(tail -n 3 "$WORK_DIR/remote-users.err" | tr '\n' ' ')"
+    fail 4 "Could not list the host userdata directory: $REMOTE_USERDATA${detail:+ ($detail)}"
+fi
+
+declare -A remote_user_ids=() local_user_ids=()
+while IFS= read -r remote_line; do
+    remote_line="${remote_line%$'\r'}"; remote_name="${remote_line##*/}"; remote_name="${remote_name%/}"
+    [[ "$remote_name" =~ ^[0-9]+$ ]] && remote_user_ids["$remote_name"]=1
+done <"$WORK_DIR/remote-users.out"
+((${#remote_user_ids[@]})) || fail 4 "The detected Steam userdata directory contains no numeric Steam user directories: $REMOTE_USERDATA"
+if ((STATE_VALID == 0)); then
+    write_host_state "$RESOLVED_HOST_PLATFORM" "$HOST_STEAM_ROOT"
+    STATE_VALID=1
+fi
+
+if [[ "$COMMAND" == "test-connection" ]]; then
+    auth_description="password or a normal SSH key"
+    ((DEDICATED_KEY_WORKS)) && auth_description="the managed read-only key"
+    show_info "Connection succeeded.
+
+Host: $REMOTE_HOST:$REMOTE_PORT
+Platform: $RESOLVED_HOST_PLATFORM
+Steam: $HOST_STEAM_ROOT
+Authentication: $auth_description
+Steam users found: ${#remote_user_ids[@]}"
+    exit 0
+fi
+
+if [[ "$COMMAND" == "setup-key" ]]; then setup_restricted_key; exit 0; fi
+
+if [[ "$COMMAND" == "sync" && "$MODE" != "headless" && ( "$STATE_WRITTEN" -eq 1 || "$DEDICATED_KEY_BROKEN" -eq 1 ) && "$DEDICATED_KEY_WORKS" -eq 0 ]]; then
+    key_prompt="Enable passwordless artwork syncing for future runs?
+
+This creates a dedicated key instead of storing your password. It cannot open a terminal, choose commands, forward connections, or modify files; the host forces it to use read-only SFTP.
+
+Read-only SFTP can read other files available to this SSH account and is not confined to Steam directories."
+    [[ "$DEDICATED_KEY_BROKEN" -eq 0 ]] || key_prompt="The previously managed passwordless key is no longer accepted.
+
+Repair it now using this authenticated connection? The replacement remains restricted to read-only SFTP."
+    if confirm_action "$key_prompt" "Enable" "Not Now"; then setup_restricted_key; fi
+    progress_start "Comparing Steam artwork…"
+fi
+
+shopt -s nullglob
+for local_user_dir in "$CLIENT_STEAM_ROOT/userdata"/*; do
+    [[ -d "$local_user_dir" ]] || continue
+    local_user_id="${local_user_dir##*/}"
+    [[ "$local_user_id" =~ ^[0-9]+$ ]] && local_user_ids["$local_user_id"]=1
+done
+
+selected_user_ids=()
+if [[ -n "$STEAM_USER_ID" ]]; then
+    [[ -n "${remote_user_ids[$STEAM_USER_ID]+set}" ]] || fail 4 "Steam user ID $STEAM_USER_ID is not present on the host."
+    [[ -n "${local_user_ids[$STEAM_USER_ID]+set}" ]] || fail 4 "Steam user ID $STEAM_USER_ID is not present on the client."
+    selected_user_ids+=("$STEAM_USER_ID")
+else
+    while IFS= read -r user_id; do
+        [[ -n "$user_id" && -n "${remote_user_ids[$user_id]+set}" ]] && selected_user_ids+=("$user_id")
+    done < <(printf '%s\n' "${!local_user_ids[@]}" | sort -n)
+fi
+((${#selected_user_ids[@]})) || fail 4 "No numeric Steam userdata IDs are present on both host and client."
+
+image_name_parts() {
+    local name="$1"
+    if [[ "$name" =~ ^([-A-Za-z0-9_]+)\.([Pp][Nn][Gg]|[Jj][Pp][Ee]?[Gg]|[Ww][Ee][Bb][Pp]|[Tt][Gg][Aa]|[Ii][Cc][Oo])$ ]]; then
+        IMAGE_STEM="${BASH_REMATCH[1],,}"; IMAGE_EXT="${BASH_REMATCH[2],,}"; return 0
+    fi
+    return 1
+}
+extension_rank() { case "$1" in png) printf 1;; jpg) printf 2;; jpeg) printf 3;; webp) printf 4;; tga) printf 5;; ico) printf 6;; *) printf 99;; esac; }
+
+total_added=0 total_replaced=0 users_with_changes=0 users_checked=0
+sync_user_artwork() {
+    local user_id="$1" remote_grid="$HOST_SFTP_STEAM_ROOT/userdata/$1/config/grid" local_grid="$CLIENT_STEAM_ROOT/userdata/$1/config/grid" user_work="$WORK_DIR/user-$1"
+    local remote_line remote_name local_file local_name rank slot staged_file temporary_destination had_slot matching_count slot_now_exists existing_file detail
+    local user_added=0 user_replaced=0
+    local -a slots_to_download=()
+    local -A local_slots=() remote_files=() remote_ranks=()
+    progress_update "Checking artwork for Steam user $user_id…"
+    mkdir -p -- "$user_work" "$local_grid" || fail 6 "Could not prepare artwork directories for Steam user $user_id."
+    if ! sftp_list_directory "$remote_grid" "$user_work/list.out" "$user_work/list.err" "$user_work/list.batch"; then
+        progress_update "Skipping Steam user $user_id because the host has no readable grid directory."
+        return 0
+    fi
+    ((users_checked += 1))
+    for local_file in "$local_grid"/*; do
+        [[ -f "$local_file" ]] || continue
+        local_name="${local_file##*/}"; image_name_parts "$local_name" && local_slots["$IMAGE_STEM"]=1
+    done
+    while IFS= read -r remote_line; do
+        remote_line="${remote_line%$'\r'}"; remote_name="${remote_line##*/}"
+        image_name_parts "$remote_name" || continue
+        rank="$(extension_rank "$IMAGE_EXT")"
+        if [[ -z "${remote_files[$IMAGE_STEM]+set}" || "$rank" -lt "${remote_ranks[$IMAGE_STEM]}" ]]; then remote_files["$IMAGE_STEM"]="$remote_name"; remote_ranks["$IMAGE_STEM"]="$rank"; fi
+    done <"$user_work/list.out"
+    while IFS= read -r slot; do
+        [[ -n "$slot" ]] || continue
+        [[ "$CONFLICT_POLICY" != "preserve-client" || -z "${local_slots[$slot]+set}" ]] && slots_to_download+=("$slot")
+    done < <(printf '%s\n' "${!remote_files[@]}" | sort)
+    ((${#slots_to_download[@]})) || return 0
+    progress_update "Downloading ${#slots_to_download[@]} artwork file(s) for Steam user $user_id…"
+    mkdir -p -- "$user_work/downloads" || fail 6 "Could not prepare downloads for Steam user $user_id."
+    {
+        printf 'cd "%s"\n' "$remote_grid"; printf 'lcd "%s"\n' "$user_work/downloads"
+        for slot in "${slots_to_download[@]}"; do printf 'get "%s"\n' "${remote_files[$slot]}"; done
+    } >"$user_work/download.batch"
+    if ! sftp -q "${shared_ssh_options[@]}" -b "$user_work/download.batch" "$TARGET" >"$user_work/download.out" 2>"$user_work/download.err"; then
+        detail="$(tail -n 3 "$user_work/download.err" | tr '\n' ' ')"; fail 5 "Artwork download failed for Steam user $user_id.${detail:+ $detail}"
+    fi
+    for slot in "${slots_to_download[@]}"; do
+        remote_name="${remote_files[$slot]}"; staged_file="$user_work/downloads/$remote_name"
+        [[ -f "$staged_file" ]] || fail 5 "The host did not provide the expected file: $remote_name"
+        had_slot=0
+        matching_count=0
+        for local_file in "$local_grid"/*; do
+            [[ -f "$local_file" ]] || continue
+            local_name="${local_file##*/}"
+            if image_name_parts "$local_name" && [[ "$IMAGE_STEM" == "$slot" ]]; then
+                had_slot=1
+                ((matching_count += 1))
+            fi
+        done
+        [[ "$CONFLICT_POLICY" != "preserve-client" || "$had_slot" -eq 0 ]] || continue
+        if [[ "$CONFLICT_POLICY" == "host-wins" && "$matching_count" -eq 1 && -f "$local_grid/$remote_name" ]] && cmp -s -- "$staged_file" "$local_grid/$remote_name"; then
+            continue
+        fi
+        temporary_destination="$local_grid/.steam-grid-sync-$remote_name.$$"
+        cp -- "$staged_file" "$temporary_destination" || fail 6 "Could not stage $remote_name for Steam user $user_id."
+        chmod 0644 "$temporary_destination" 2>/dev/null || true
+        if [[ "$CONFLICT_POLICY" == "host-wins" ]]; then
+            mv -f -- "$temporary_destination" "$local_grid/$remote_name" || fail 6 "Could not install $remote_name for Steam user $user_id."
+            for existing_file in "$local_grid"/*; do
+                [[ -f "$existing_file" && "$existing_file" != "$local_grid/$remote_name" ]] || continue
+                local_name="${existing_file##*/}"
+                if image_name_parts "$local_name" && [[ "$IMAGE_STEM" == "$slot" ]]; then rm -f -- "$existing_file" || fail 6 "Could not remove superseded client artwork $local_name."; fi
+            done
+            if ((had_slot)); then ((user_replaced += 1)); else ((user_added += 1)); fi
+        else
+            slot_now_exists=0
+            for existing_file in "$local_grid"/*; do
+                [[ -f "$existing_file" ]] || continue
+                local_name="${existing_file##*/}"
+                if image_name_parts "$local_name" && [[ "$IMAGE_STEM" == "$slot" ]]; then slot_now_exists=1; break; fi
+            done
+            if ((slot_now_exists)); then rm -f -- "$temporary_destination"; continue; fi
+            mv -n -- "$temporary_destination" "$local_grid/$remote_name" || fail 6 "Could not install $remote_name for Steam user $user_id."
+            if [[ -e "$temporary_destination" ]]; then rm -f -- "$temporary_destination"; else ((user_added += 1)); fi
+        fi
+    done
+    if ((user_added + user_replaced > 0)); then ((users_with_changes += 1)); ((total_added += user_added)); ((total_replaced += user_replaced)); fi
+}
+
+for selected_user_id in "${selected_user_ids[@]}"; do sync_user_artwork "$selected_user_id"; done
+if ((total_added + total_replaced == 0)); then
+    progress_stop
+    show_info "Artwork is already up to date across ${#selected_user_ids[@]} matching Steam user(s)."
+    [[ "$MODE" == "headless" ]] && printf 'RESULT=unchanged ADDED=0 REPLACED=0 USERS=%d\n' "${#selected_user_ids[@]}"
+    exit 0
+fi
+
+summary="Added $total_added and replaced $total_replaced artwork slot(s) across $users_with_changes Steam user(s)."
+progress_stop
+[[ "$MODE" == "headless" ]] && printf 'RESULT=changed ADDED=%d REPLACED=%d USERS=%d\n' "$total_added" "$total_replaced" "$users_with_changes"
+
+restart_steam() {
+    steam -shutdown >/dev/null 2>&1 || true
+    local attempt
+    for attempt in {1..30}; do pgrep -x steam >/dev/null 2>&1 || break; sleep 1; done
+    if pgrep -x steam >/dev/null 2>&1; then show_error "Artwork was synchronized, but Steam did not close within 30 seconds. It was not force-terminated."; return 7; fi
+    nohup steam >/dev/null 2>&1 & disown || true
+}
+if ! pgrep -x steam >/dev/null 2>&1; then
+    show_info "$summary
+
+The new artwork will appear when Steam is next started."
+    exit 0
+fi
+case "$RESTART_POLICY" in
+    always)
+        restart_steam || exit $?
+        show_info "$summary
+
+Steam has been restarted to load the new artwork."
+        ;;
+    never)
+        show_info "$summary
+
+The new artwork will appear after Steam is next restarted."
+        ;;
+    ask)
+        if confirm_action "$summary
+
+Restart Steam now to load it?" "Restart Steam" "Later"; then
+            restart_steam || exit $?
+            show_info "Steam has been restarted and the new artwork is ready."
+        else
+            show_info "The new artwork will appear after Steam is next restarted."
+        fi
+        ;;
+esac
+exit 0

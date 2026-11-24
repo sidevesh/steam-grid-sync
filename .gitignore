@@ -1,0 +1,7 @@
+.DS_Store
+/config
+/host-state
+/known_hosts*
+/keys/
+/steam-grid-sync.config
+/steam-grid-sync.known_hosts
